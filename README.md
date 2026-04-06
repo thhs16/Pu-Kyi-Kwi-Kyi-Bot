@@ -1,2 +1,2 @@
 # Pu-Kyi-Kwi-Kyi-Bot
-PuKyiKwiKyiBot is a telegram AI Bot that summarizes long group chats, helping users quickly see who said what without reading 1000+ messages.
+Pu Kyi Kwi Kyi Bot is a Telegram AI Bot that summarizes long group chats, helping users quickly see who said what without reading 1000+ messages.
