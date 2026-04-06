@@ -5,6 +5,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 
+
+
 # === CONFIG ===
 import os
 
@@ -245,3 +247,6 @@ app.add_handler(CommandHandler("stats", stats))
 
 print("Bot is running...")
 app.run_polling()
+
+#render
+app.run_polling(drop_pending_updates=True)
