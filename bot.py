@@ -10,9 +10,9 @@ from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from google import genai
+from google.genai import errors  # Added to catch specific API errors
 
 # === CONFIG ===
-# Note: Railway does NOT need proxy settings. I have removed them to prevent connection errors.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 # === DATABASE FUNCTIONS ===
 def get_conn():
-    # Railway Postgres usually requires SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
@@ -71,16 +70,19 @@ def is_spamming(user_id):
 
 # === AI PROCESSING ===
 async def get_embedding(text):
-    try:
-        response = await asyncio.to_thread(
-            client.models.embed_content,
-            model="models/text-embedding-004",
-            contents=text
-        )
-        return response.embeddings[0].values
-    except Exception as e:
-        logger.error(f"Embedding error: {e}")
-        return None
+    models_to_try = ["text-embedding-004", "embedding-001"]
+    for model_name in models_to_try:
+        try:
+            response = await asyncio.to_thread(
+                client.models.embed_content,
+                model=model_name,
+                contents=text
+            )
+            return response.embeddings[0].values
+        except Exception as e:
+            logger.warning(f"Failed with {model_name}: {e}")
+            continue
+    return None
 
 def cosine_similarity(a, b):
     if not a or not b: return 0
@@ -101,7 +103,7 @@ async def detect_topic(text):
     except:
         return "general"
 
-# === CORE LOGIC ===
+# === DATABASE OPERATIONS ===
 async def save_message(update: Update):
     if not update.message or not update.message.text: return
     text = update.message.text.strip()
@@ -131,8 +133,10 @@ async def get_relevant_messages(user_input, limit=10):
     scored = []
     for u, t, emb in rows:
         try:
-            score = cosine_similarity(query_embedding, json.loads(emb))
-            scored.append((score, u, t))
+            val = json.loads(emb)
+            if val:
+                score = cosine_similarity(query_embedding, val)
+                scored.append((score, u, t))
         except: continue
     scored.sort(reverse=True)
     return [(u, t) for score, u, t in scored[:limit] if score > 0.5]
@@ -171,29 +175,29 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prompt = f"""
 You are a very polite, warm, and helpful MALE AI assistant.
-
-IMPORTANT RULES:
-1. If the user speaks Burmese, you MUST use the polite male ending particles: "ခင်ဗျာ" and "ခင်ဗျ".
-2. Tone: Be helpful, caring, and gentlemanly (like a caring brother).
-3. Use friendly emojis: 😊, 🙏, ✨.
-4. Detect the user's language and reply in the SAME language.
-5. Provide practical advice if the situation calls for it (e.g., weather, health, or safety).
+- In Burmese, use polite male particles: "ခင်ဗျာ" and "ခင်ဗျ".
+- Tone: Caring gentleman.
+- Emojis: 😊, 🙏, ✨.
+- Language: Same as user.
 
 Context:
 {format_messages(context_msgs)}
 
 User:
 {user_input}
-
-Response (in a polite male tone):
 """
     try:
         response = await asyncio.to_thread(client.models.generate_content, model="gemini-2.5-flash-lite", contents=prompt)
         await update.message.reply_text(response.text)
+    except errors.ClientError as e:
+        if e.code == 429:
+            await update.message.reply_text("တောင်းပန်ပါတယ်ခင်ဗျာ။ ဒီနေ့အတွက် အခမဲ့အသုံးပြုခွင့် (Free Limit) ကုန်ဆုံးသွားလို့ပါခင်ဗျ။ ခဏနေမှဖြစ်ဖြစ်၊ မနက်ဖြန်မှဖြစ်ဖြစ် ပြန်ကြိုးစားပေးပါဦး ခင်ဗျာ။ 🙏")
+        else:
+            await update.message.reply_text("⚠️ စနစ်မှာ အမှားအယွင်းတစ်ခု ရှိနေလို့ပါ ခင်ဗျာ။")
     except:
-        await update.message.reply_text("⚠️ စနစ်အနည်းငယ် အလုပ်များနေလို့ပါ ခင်ဗျာ။ ခဏနေမှ ပြန်ကြိုးစားပေးပါဦး ခင်ဗျ။")
+        await update.message.reply_text("⚠️ စနစ်အနည်းငယ် အလုပ်များနေလို့ပါ ခင်ဗျာ။")
 
-# === SUMMARY COMMANDS ===
+# === SUMMARY LOGIC ===
 async def generate_summary(days):
     conn = get_conn()
     cur = conn.cursor()
@@ -206,21 +210,19 @@ async def generate_summary(days):
     if not rows: return "ပြောဆိုထားတဲ့ စာတိုလေးတွေ မတွေ့ရသေးပါဘူး ခင်ဗျာ။"
 
     text_data = "\n".join([f"{u}: {t}" for u, t in rows])
-    prompt = f"""
-You are a polite MALE assistant. Summarize this chat history:
-- Use the same language as the chat.
-- If in Burmese, use the polite male particles "ခင်ဗျာ/ခင်ဗျ".
-- Be friendly and highlight key discussions or decisions.
-
-Chat:
-{text_data}
-"""
+    prompt = f"Summarize this chat in Burmese with a polite male tone (ခင်ဗျာ/ခင်ဗျ):\n\n{text_data}"
+    
     try:
         response = await asyncio.to_thread(client.models.generate_content, model="gemini-2.5-flash-lite", contents=prompt)
         return response.text
+    except errors.ClientError as e:
+        if e.code == 429:
+            return "ဒီနေ့အတွက် အခမဲ့အသုံးပြုခွင့် (Free Limit) ကုန်ဆုံးသွားလို့ အကျဉ်းချုပ်ပေးလို့ မရသေးပါဘူး ခင်ဗျာ။ 🙏"
+        return "⚠️ စနစ်မှာ အမှားအယွင်းတစ်ခု ဖြစ်နေပါတယ် ခင်ဗျာ။"
     except:
         return "⚠️ အကျဉ်းချုပ်ဖို့ အခက်အခဲရှိနေပါတယ် ခင်ဗျာ။"
 
+# === COMMAND HANDLERS ===
 async def todaysummary(update, context):
     await update.message.reply_text(await generate_summary(1))
 
@@ -252,7 +254,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === START APPLICATION ===
 if __name__ == "__main__":
-    # Increased timeouts for Railway stability
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -270,5 +271,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("lastweeksummary", lastweeksummary))
     app.add_handler(CommandHandler("stats", stats))
 
-    logger.info("Bot is running on Railway...")
+    logger.info("Bot is running...")
     app.run_polling(drop_pending_updates=True)
