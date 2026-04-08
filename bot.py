@@ -1,13 +1,14 @@
 import os
 import logging
 import asyncio
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 from collections import Counter
 
 import psycopg2
 from telegram import Update
 from telegram.constants import ChatAction
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from google import genai
 
 # === CONFIG ===
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# === INIT DB (ADD EMBEDDING + TOPIC) ===
+# === INIT DB ===
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -59,7 +60,7 @@ async def get_bot_username(context):
         BOT_USERNAME = bot.username.lower()
     return BOT_USERNAME
 
-# === SPAM ===
+# === SPAM PROTECTION ===
 def is_spamming(user_id):
     now = datetime.now().timestamp()
     if user_id in user_last_message and now - user_last_message[user_id] < 2:
@@ -72,15 +73,15 @@ async def get_embedding(text):
     try:
         response = await asyncio.to_thread(
             client.models.embed_content,
-            model="text-embedding-004",
+            model="embedding-001",
             contents=text
         )
         return response.embeddings[0].values
     except Exception as e:
-        logger.error(e)
+        logger.error(f"Embedding error: {e}")
         return None
 
-# === SIMILARITY ===
+# === COSINE SIMILARITY ===
 def cosine_similarity(a, b):
     if not a or not b:
         return 0
@@ -89,9 +90,14 @@ def cosine_similarity(a, b):
     norm_b = sum(x*x for x in b) ** 0.5
     return dot / (norm_a * norm_b + 1e-8)
 
-# === TOPIC DETECTION (simple AI) ===
+# === TOPIC DETECTION (Burmese-friendly) ===
 async def detect_topic(text):
-    prompt = f"Give a short topic (1-2 words) for this message:\n{text}"
+    prompt = f"""
+အောက်ပါစာကို အကြောင်းအရာအတိုချုံး (topic) ၁-၂ လုံးဖြင့် ပြောပါ။
+
+Text:
+{text}
+"""
     try:
         response = await asyncio.to_thread(
             client.models.generate_content,
@@ -99,7 +105,8 @@ async def detect_topic(text):
             contents=prompt
         )
         return response.text.strip().lower()
-    except:
+    except Exception as e:
+        logger.error(f"Topic error: {e}")
         return "general"
 
 # === SAVE MESSAGE ===
@@ -107,7 +114,7 @@ async def save_message(update: Update):
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text
+    text = update.message.text.strip()
 
     embedding = await get_embedding(text)
     topic = await detect_topic(text)
@@ -124,7 +131,7 @@ async def save_message(update: Update):
             update.message.from_user.first_name,
             update.message.chat.id,
             text,
-            str(embedding),
+            json.dumps(embedding),  # SAFE storage
             topic,
             datetime.now()
         ))
@@ -134,7 +141,7 @@ async def save_message(update: Update):
         conn.close()
 
     except Exception as e:
-        logger.error(e)
+        logger.error(f"DB SAVE ERROR: {e}")
 
 # === SEMANTIC SEARCH ===
 async def get_relevant_messages(user_input, limit=10):
@@ -146,18 +153,18 @@ async def get_relevant_messages(user_input, limit=10):
     cur.execute("SELECT user_name, text, embedding FROM messages ORDER BY id DESC LIMIT 100")
     rows = cur.fetchall()
 
+    cur.close()
+    conn.close()
+
     scored = []
 
     for u, t, emb in rows:
         try:
-            emb_list = eval(emb)
+            emb_list = json.loads(emb)
             score = cosine_similarity(query_embedding, emb_list)
             scored.append((score, u, t))
         except:
             continue
-
-    cur.close()
-    conn.close()
 
     scored.sort(reverse=True)
     return [(u, t) for score, u, t in scored[:limit] if score > 0.5]
@@ -187,7 +194,7 @@ async def get_topic_messages(user_input):
 def format_messages(msgs):
     return "\n".join([f"{u}: {t}" for u, t in msgs])
 
-# === AI ===
+# === AI RESPONSE ===
 async def generate_ai(prompt):
     return await asyncio.to_thread(
         client.models.generate_content,
@@ -200,7 +207,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    if is_spamming(update.message.from_user.id):
+    user_id = update.message.from_user.id
+
+    if is_spamming(user_id):
         return
 
     user_input = update.message.text
@@ -220,7 +229,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action=ChatAction.TYPING
     )
 
-    # 🧠 Semantic + Topic
+    # 🧠 Context building
     semantic_msgs = await get_relevant_messages(user_input)
     topic_msgs = await get_topic_messages(user_input)
 
@@ -230,9 +239,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 You are a smart assistant.
 
 IMPORTANT:
-- Answer ONLY the question
+- Answer ONLY the user’s question
 - Ignore unrelated context
-- Reply in Burmese
+- Always reply in Burmese
 
 Context:
 {format_messages(context_msgs)}
@@ -245,18 +254,19 @@ User:
         response = await generate_ai(prompt)
         await update.message.reply_text(response.text)
     except Exception as e:
-        logger.error(e)
-        await update.message.reply_text("⚠️ Error")
+        logger.error(f"AI ERROR: {e}")
+        await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
 
 # === HANDLER ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_message(update)
     await chat(update, context)
 
-# === BUILD ===
+# === APP ===
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-print("Bot running...")
+logger.info("Bot is running...")
 
 app.run_polling(drop_pending_updates=True)
