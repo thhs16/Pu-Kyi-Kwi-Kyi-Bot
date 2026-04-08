@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter
 
 import psycopg2
@@ -16,16 +16,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set!")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === DB CONNECTION ===
+# === DB ===
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# === INIT DB ===
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -60,7 +62,7 @@ async def get_bot_username(context):
         BOT_USERNAME = bot.username.lower()
     return BOT_USERNAME
 
-# === SPAM PROTECTION ===
+# === SPAM ===
 def is_spamming(user_id):
     now = datetime.now().timestamp()
     if user_id in user_last_message and now - user_last_message[user_id] < 2:
@@ -81,7 +83,7 @@ async def get_embedding(text):
         logger.error(f"Embedding error: {e}")
         return None
 
-# === COSINE SIMILARITY ===
+# === SIMILARITY ===
 def cosine_similarity(a, b):
     if not a or not b:
         return 0
@@ -90,12 +92,11 @@ def cosine_similarity(a, b):
     norm_b = sum(x*x for x in b) ** 0.5
     return dot / (norm_a * norm_b + 1e-8)
 
-# === TOPIC DETECTION (Burmese-friendly) ===
+# === TOPIC DETECTION ===
 async def detect_topic(text):
     prompt = f"""
 အောက်ပါစာကို အကြောင်းအရာအတိုချုံး (topic) ၁-၂ လုံးဖြင့် ပြောပါ။
 
-Text:
 {text}
 """
     try:
@@ -105,54 +106,46 @@ Text:
             contents=prompt
         )
         return response.text.strip().lower()
-    except Exception as e:
-        logger.error(f"Topic error: {e}")
+    except:
         return "general"
 
-# === SAVE MESSAGE ===
+# === SAVE ===
 async def save_message(update: Update):
     if not update.message or not update.message.text:
         return
 
     text = update.message.text.strip()
-
     embedding = await get_embedding(text)
     topic = await detect_topic(text)
 
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
+    conn = get_conn()
+    cur = conn.cursor()
 
-        cur.execute("""
-        INSERT INTO messages (user_id, user_name, chat_id, text, embedding, topic, time)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            update.message.from_user.id,
-            update.message.from_user.first_name,
-            update.message.chat.id,
-            text,
-            json.dumps(embedding),  # SAFE storage
-            topic,
-            datetime.now()
-        ))
+    cur.execute("""
+    INSERT INTO messages (user_id, user_name, chat_id, text, embedding, topic, time)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """, (
+        update.message.from_user.id,
+        update.message.from_user.first_name,
+        update.message.chat.id,
+        text,
+        json.dumps(embedding),
+        topic,
+        datetime.now()
+    ))
 
-        conn.commit()
-        cur.close()
-        conn.close()
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    except Exception as e:
-        logger.error(f"DB SAVE ERROR: {e}")
-
-# === SEMANTIC SEARCH ===
+# === SEARCH ===
 async def get_relevant_messages(user_input, limit=10):
     query_embedding = await get_embedding(user_input)
 
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("SELECT user_name, text, embedding FROM messages ORDER BY id DESC LIMIT 100")
     rows = cur.fetchall()
-
     cur.close()
     conn.close()
 
@@ -183,7 +176,6 @@ async def get_topic_messages(user_input):
     """, (topic,))
 
     rows = cur.fetchall()
-
     cur.close()
     conn.close()
 
@@ -194,7 +186,7 @@ async def get_topic_messages(user_input):
 def format_messages(msgs):
     return "\n".join([f"{u}: {t}" for u, t in msgs])
 
-# === AI RESPONSE ===
+# === AI ===
 async def generate_ai(prompt):
     return await asyncio.to_thread(
         client.models.generate_content,
@@ -207,9 +199,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    user_id = update.message.from_user.id
-
-    if is_spamming(user_id):
+    if is_spamming(update.message.from_user.id):
         return
 
     user_input = update.message.text
@@ -224,24 +214,19 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_reply and f"@{bot_username}" not in user_input.lower():
             return
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING
-    )
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # 🧠 Context building
     semantic_msgs = await get_relevant_messages(user_input)
     topic_msgs = await get_topic_messages(user_input)
-
     context_msgs = (semantic_msgs + topic_msgs)[-10:]
 
     prompt = f"""
 You are a smart assistant.
 
 IMPORTANT:
-- Answer ONLY the user’s question
+- Answer ONLY the question
 - Ignore unrelated context
-- Always reply in Burmese
+- Reply in Burmese
 
 Context:
 {format_messages(context_msgs)}
@@ -253,9 +238,67 @@ User:
     try:
         response = await generate_ai(prompt)
         await update.message.reply_text(response.text)
-    except Exception as e:
-        logger.error(f"AI ERROR: {e}")
+    except:
         await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
+
+# === SUMMARY ===
+async def generate_summary(days):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cutoff = datetime.now() - timedelta(days=days)
+    cur.execute("SELECT user_name, text FROM messages WHERE time >= %s", (cutoff,))
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return "စာမတွေ့ပါ။"
+
+    text = "\n".join([f"{u}: {t}" for u, t in rows])
+
+    prompt = f"""
+အောက်ပါ chat ကို အကျဉ်းချုပ်ပေးပါ။
+
+- မြန်မာဘာသာဖြင့်
+- အဓိကအချက်များ
+- ဆုံးဖြတ်ချက်များ (ရှိပါက)
+
+{text}
+"""
+
+    response = await generate_ai(prompt)
+    return response.text
+
+# === COMMANDS ===
+async def todaysummary(update, context):
+    await update.message.reply_text(await generate_summary(1))
+
+async def yesterdaysummary(update, context):
+    await update.message.reply_text(await generate_summary(2))
+
+async def last3dayssummary(update, context):
+    await update.message.reply_text(await generate_summary(3))
+
+async def lastweeksummary(update, context):
+    await update.message.reply_text(await generate_summary(7))
+
+async def stats(update, context):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_name FROM messages")
+    users = [r[0] for r in cur.fetchall()]
+    cur.close()
+    conn.close()
+
+    count = Counter(users)
+
+    result = "📊 Top Users:\n"
+    for u, c in count.most_common(5):
+        result += f"- {u}: {c}\n"
+
+    await update.message.reply_text(result)
 
 # === HANDLER ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,6 +309,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+
+app.add_handler(CommandHandler("todaysummary", todaysummary))
+app.add_handler(CommandHandler("yesterdaysummary", yesterdaysummary))
+app.add_handler(CommandHandler("last3dayssummary", last3dayssummary))
+app.add_handler(CommandHandler("lastweeksummary", lastweeksummary))
+app.add_handler(CommandHandler("stats", stats))
 
 logger.info("Bot is running...")
 
