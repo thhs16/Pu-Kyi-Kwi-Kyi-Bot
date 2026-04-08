@@ -11,25 +11,23 @@ from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 from google import genai
 
-# === CONFIG & PROXY ===
-# Required for PythonAnywhere Free Tier to reach Google/Telegram APIs
-os.environ['http_proxy'] = "http://proxy.server:3128"
-os.environ['https_proxy'] = "http://proxy.server:3128"
-
+# === CONFIG ===
+# Note: Railway does NOT need proxy settings. I have removed them to prevent connection errors.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL is not set!")
+    raise ValueError("DATABASE_URL is not set in Railway variables!")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# === DB ===
+# === DATABASE FUNCTIONS ===
 def get_conn():
+    # Railway Postgres usually requires SSL
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
@@ -53,7 +51,7 @@ def init_db():
 
 init_db()
 
-# === CACHE & UTILS ===
+# === UTILS ===
 BOT_USERNAME = None
 user_last_message = {}
 
@@ -71,7 +69,7 @@ def is_spamming(user_id):
     user_last_message[user_id] = now
     return False
 
-# === AI FEATURES ===
+# === AI PROCESSING ===
 async def get_embedding(text):
     try:
         response = await asyncio.to_thread(
@@ -103,7 +101,7 @@ async def detect_topic(text):
     except:
         return "general"
 
-# === DATABASE OPERATIONS ===
+# === CORE LOGIC ===
 async def save_message(update: Update):
     if not update.message or not update.message.text: return
     text = update.message.text.strip()
@@ -153,7 +151,7 @@ async def get_topic_messages(user_input):
 def format_messages(msgs):
     return "\n".join([f"{u}: {t}" for u, t in msgs])
 
-# === CORE AI CHAT ===
+# === AI CHAT HANDLER ===
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text: return
     if is_spamming(update.message.from_user.id): return
@@ -175,11 +173,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 You are a very polite, warm, and helpful MALE AI assistant.
 
 IMPORTANT RULES:
-- If the user speaks Burmese, you MUST use the polite male particles: "ခင်ဗျာ" (at the end of sentences) and "ခင်ဗျ".
-- Tone: Caring, gentlemanly, and friendly (like the helpful weather example). 
-- Use warm emojis: 😊, 🙏, ✨.
-- Detect the user's language and reply in that SAME language.
-- Provide useful advice if the context allows.
+1. If the user speaks Burmese, you MUST use the polite male ending particles: "ခင်ဗျာ" and "ခင်ဗျ".
+2. Tone: Be helpful, caring, and gentlemanly (like a caring brother).
+3. Use friendly emojis: 😊, 🙏, ✨.
+4. Detect the user's language and reply in the SAME language.
+5. Provide practical advice if the situation calls for it (e.g., weather, health, or safety).
 
 Context:
 {format_messages(context_msgs)}
@@ -195,7 +193,7 @@ Response (in a polite male tone):
     except:
         await update.message.reply_text("⚠️ စနစ်အနည်းငယ် အလုပ်များနေလို့ပါ ခင်ဗျာ။ ခဏနေမှ ပြန်ကြိုးစားပေးပါဦး ခင်ဗျ။")
 
-# === SUMMARY LOGIC ===
+# === SUMMARY COMMANDS ===
 async def generate_summary(days):
     conn = get_conn()
     cur = conn.cursor()
@@ -210,9 +208,9 @@ async def generate_summary(days):
     text_data = "\n".join([f"{u}: {t}" for u, t in rows])
     prompt = f"""
 You are a polite MALE assistant. Summarize this chat history:
-- Language: Same as chat (English/Burmese).
-- Tone: Friendly, warm, and polite (using "ခင်ဗျာ/ခင်ဗျ" in Burmese).
-- Content: Highlight key topics and decisions.
+- Use the same language as the chat.
+- If in Burmese, use the polite male particles "ခင်ဗျာ/ခင်ဗျ".
+- Be friendly and highlight key discussions or decisions.
 
 Chat:
 {text_data}
@@ -223,7 +221,6 @@ Chat:
     except:
         return "⚠️ အကျဉ်းချုပ်ဖို့ အခက်အခဲရှိနေပါတယ် ခင်ဗျာ။"
 
-# === COMMAND HANDLERS ===
 async def todaysummary(update, context):
     await update.message.reply_text(await generate_summary(1))
 
@@ -253,9 +250,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_message(update)
     await chat(update, context)
 
-# === START APP ===
+# === START APPLICATION ===
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Increased timeouts for Railway stability
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
 
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
     app.add_handler(CommandHandler("todaysummary", todaysummary))
@@ -264,5 +270,5 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("lastweeksummary", lastweeksummary))
     app.add_handler(CommandHandler("stats", stats))
 
-    logger.info("Bot is running...")
+    logger.info("Bot is running on Railway...")
     app.run_polling(drop_pending_updates=True)
