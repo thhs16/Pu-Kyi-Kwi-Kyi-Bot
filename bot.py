@@ -230,9 +230,10 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 You are a friendly MALE AI assistant.
 
 IMPORTANT:
-- Only use Burmese to reply
-- Use a warm, friendly, natural, funny tone
-- Speak in male tone
+- Detect the user's language
+- Reply in the SAME language (English or Burmese)
+- Use a warm, friendly, natural tone
+- Speak in a slightly masculine, polite style
 - Be clear and easy to understand
 - Answer ONLY the user's question
 - Ignore unrelated context
@@ -269,18 +270,16 @@ async def generate_summary(days):
     text = "\n".join([f"{u}: {t}" for u, t in rows])
 
     prompt = f"""
-အောက်ပါ chat ကို WHO SAID WHAT အလိုက် အကျဉ်းချုပ်ပေးပါ။
+You are a friendly MALE assistant.
 
-IMPORTANT:
-- မြန်မာဘာသာဖြင့် ပြန်ပါ
-- နားလည်လွယ်အောင် ရေးပါ
+Summarize this chat:
 
-Format:
-Summary:
-- Name: အဓိကအချက်
+- Use the same language as the chat (English/Burmese)
+- Be friendly and easy to read
+- Highlight key points
+- Include decisions if any
+- Keep a warm, natural tone
 
-ပြီးလျှင်:
-Decision (ရှိပါက)
 Chat:
 {text}
 """
