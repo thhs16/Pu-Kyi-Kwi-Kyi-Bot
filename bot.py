@@ -270,16 +270,18 @@ async def generate_summary(days):
     text = "\n".join([f"{u}: {t}" for u, t in rows])
 
     prompt = f"""
-You are a friendly MALE assistant.
+အောက်ပါ chat ကို WHO SAID WHAT အလိုက် အကျဉ်းချုပ်ပေးပါ။
 
-Summarize this chat:
+IMPORTANT:
+- မြန်မာဘာသာဖြင့် ပြန်ပါ
+- နားလည်လွယ်အောင် ရေးပါ
 
-- Use the same language as the chat (English/Burmese)
-- Be friendly and easy to read
-- Highlight key points
-- Include decisions if any
-- Keep a warm, natural tone
+Format:
+Summary:
+- Name: အဓိကအချက်
 
+ပြီးလျှင်:
+Decision (ရှိပါက)
 Chat:
 {text}
 """
