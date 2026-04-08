@@ -1,8 +1,8 @@
-from datetime import datetime, timedelta
-import sqlite3
-from collections import Counter
 import os
 import logging
+import sqlite3
+from datetime import datetime
+from collections import Counter
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -62,24 +62,24 @@ def get_recent(limit=50):
 def format_messages(msgs):
     return "\n".join([f"{u}: {t}" for u, t in msgs])
 
-# === CHAT FUNCTION ===
+# === CHAT ===
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     user_input = update.message.text
 
-    # 🔥 FIX: safely get bot username
+    # ✅ Safe bot username
     bot = await context.bot.get_me()
     bot_username = bot.username.lower()
 
-    logger.info(f"Incoming message: {user_input}")
+    logger.info(f"Incoming: {user_input}")
     logger.info(f"Bot username: @{bot_username}")
 
-    # Only respond if mentioned in group
+    # ✅ Group logic (must mention bot)
     if update.message.chat.type != "private":
         if f"@{bot_username}" not in user_input.lower():
-            logger.info("Bot not mentioned, ignoring...")
+            logger.info("Not mentioned → ignoring")
             return
 
     recent = get_recent(50)
@@ -111,7 +111,7 @@ Answer in Burmese:
         logger.error(f"AI ERROR: {e}")
         await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
 
-# === ANALYTICS ===
+# === STATS ===
 def get_top_users(limit=100):
     cursor.execute(
         "SELECT user FROM messages ORDER BY id DESC LIMIT ?",
@@ -126,11 +126,10 @@ def get_top_users(limit=100):
 
     return result
 
-# === COMMANDS ===
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(get_top_users())
 
-# === COMBINED HANDLER ===
+# === HANDLER ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_message(update, context)
     await chat(update, context)
@@ -141,7 +140,7 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 app.add_handler(CommandHandler("stats", stats))
 
-logger.info("Bot is starting...",)
+logger.info("Bot is starting...")
 
-# === RUN ===
+# ✅ RUN (ONLY ONCE)
 app.run_polling(drop_pending_updates=True)
