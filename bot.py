@@ -70,12 +70,12 @@ def is_spamming(user_id):
     user_last_message[user_id] = now
     return False
 
-# === EMBEDDING ===
+# === EMBEDDING (SAFE FALLBACK) ===
 async def get_embedding(text):
     try:
         response = await asyncio.to_thread(
             client.models.embed_content,
-            model="embedding-001",
+            model="models/text-embedding-004",
             contents=text
         )
         return response.embeddings[0].values
@@ -95,7 +95,7 @@ def cosine_similarity(a, b):
 # === TOPIC DETECTION ===
 async def detect_topic(text):
     prompt = f"""
-အောက်ပါစာကို အကြောင်းအရာအတိုချုံး (topic) ၁-၂ လုံးဖြင့် ပြောပါ။
+Summarize this text into a short topic (1-2 words).
 
 {text}
 """
@@ -138,9 +138,12 @@ async def save_message(update: Update):
     cur.close()
     conn.close()
 
-# === SEARCH ===
+# === SEMANTIC SEARCH ===
 async def get_relevant_messages(user_input, limit=10):
     query_embedding = await get_embedding(user_input)
+
+    if not query_embedding:
+        return []
 
     conn = get_conn()
     cur = conn.cursor()
@@ -154,6 +157,8 @@ async def get_relevant_messages(user_input, limit=10):
     for u, t, emb in rows:
         try:
             emb_list = json.loads(emb)
+            if not emb_list:
+                continue
             score = cosine_similarity(query_embedding, emb_list)
             scored.append((score, u, t))
         except:
@@ -218,15 +223,21 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     semantic_msgs = await get_relevant_messages(user_input)
     topic_msgs = await get_topic_messages(user_input)
+
     context_msgs = (semantic_msgs + topic_msgs)[-10:]
 
     prompt = f"""
-You are a smart assistant.
+You are a friendly MALE AI assistant.
 
 IMPORTANT:
-- Answer ONLY the question
+- Detect the user's language
+- Reply in the SAME language (English or Burmese)
+- Use a warm, friendly, natural tone
+- Speak in a slightly masculine, polite style
+- Be clear and easy to understand
+- Answer ONLY the user's question
 - Ignore unrelated context
-- Reply in Burmese
+- If unsure, answer honestly
 
 Context:
 {format_messages(context_msgs)}
@@ -239,7 +250,7 @@ User:
         response = await generate_ai(prompt)
         await update.message.reply_text(response.text)
     except:
-        await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
+        await update.message.reply_text("⚠️ AI is temporarily unavailable.")
 
 # === SUMMARY ===
 async def generate_summary(days):
@@ -254,17 +265,22 @@ async def generate_summary(days):
     conn.close()
 
     if not rows:
-        return "စာမတွေ့ပါ။"
+        return "No messages found."
 
     text = "\n".join([f"{u}: {t}" for u, t in rows])
 
     prompt = f"""
-အောက်ပါ chat ကို အကျဉ်းချုပ်ပေးပါ။
+You are a friendly MALE assistant.
 
-- မြန်မာဘာသာဖြင့်
-- အဓိကအချက်များ
-- ဆုံးဖြတ်ချက်များ (ရှိပါက)
+Summarize this chat:
 
+- Use the same language as the chat (English/Burmese)
+- Be friendly and easy to read
+- Highlight key points
+- Include decisions if any
+- Keep a warm, natural tone
+
+Chat:
 {text}
 """
 
