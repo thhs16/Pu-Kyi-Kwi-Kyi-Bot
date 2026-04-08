@@ -5,35 +5,30 @@ from datetime import datetime, timedelta
 from collections import Counter
 
 import psycopg2
-from psycopg2.extras import RealDictCursor
-
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
-
-# === LOGGING ===
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-if not BOT_TOKEN or not GEMINI_API_KEY or not DATABASE_URL:
-    raise ValueError("Missing BOT_TOKEN, GEMINI_API_KEY, or DATABASE_URL")
-
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# === DATABASE CONNECTION ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# === DB CONNECTION ===
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
-# === INIT DB ===
+# === INIT DB (ADD EMBEDDING + TOPIC) ===
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS messages (
         id SERIAL PRIMARY KEY,
@@ -41,9 +36,12 @@ def init_db():
         user_name TEXT,
         chat_id BIGINT,
         text TEXT,
+        embedding TEXT,
+        topic TEXT,
         time TIMESTAMP
     )
     """)
+
     conn.commit()
     cur.close()
     conn.close()
@@ -61,83 +59,7 @@ async def get_bot_username(context):
         BOT_USERNAME = bot.username.lower()
     return BOT_USERNAME
 
-# === SAVE MESSAGE ===
-async def save_message(update: Update):
-    if update.message and update.message.text:
-        try:
-            conn = get_conn()
-            cur = conn.cursor()
-
-            cur.execute(
-                "INSERT INTO messages (user_id, user_name, chat_id, text, time) VALUES (%s, %s, %s, %s, %s)",
-                (
-                    update.message.from_user.id,
-                    update.message.from_user.first_name,
-                    update.message.chat.id,
-                    update.message.text,
-                    datetime.now()
-                )
-            )
-
-            conn.commit()
-            cur.close()
-            conn.close()
-
-        except Exception as e:
-            logger.error(f"DB SAVE ERROR: {e}")
-
-# === DATA FUNCTIONS ===
-def get_recent(limit=50):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT user_name, text FROM messages ORDER BY id DESC LIMIT %s",
-            (limit,)
-        )
-
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        rows.reverse()
-        return rows
-
-    except Exception as e:
-        logger.error(f"DB FETCH ERROR: {e}")
-        return []
-
-def get_messages_by_days(days):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cutoff = datetime.now() - timedelta(days=days)
-
-        cur.execute(
-            "SELECT user_name, text FROM messages WHERE time >= %s",
-            (cutoff,)
-        )
-
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        return rows
-
-    except Exception as e:
-        logger.error(f"DB FILTER ERROR: {e}")
-        return []
-
-def filter_important(messages):
-    keywords = ["important", "decide", "plan", "meeting", "deadline", "?"]
-    return [m for m in messages if any(k in m[1].lower() for k in keywords)]
-
-def format_messages(msgs):
-    return "\n".join([f"{u}: {t}" for u, t in msgs])
-
-# === SPAM PROTECTION ===
+# === SPAM ===
 def is_spamming(user_id):
     now = datetime.now().timestamp()
     if user_id in user_last_message and now - user_last_message[user_id] < 2:
@@ -145,7 +67,127 @@ def is_spamming(user_id):
     user_last_message[user_id] = now
     return False
 
-# === AI CALL ===
+# === EMBEDDING ===
+async def get_embedding(text):
+    try:
+        response = await asyncio.to_thread(
+            client.models.embed_content,
+            model="text-embedding-004",
+            contents=text
+        )
+        return response.embeddings[0].values
+    except Exception as e:
+        logger.error(e)
+        return None
+
+# === SIMILARITY ===
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0
+    dot = sum(x*y for x, y in zip(a, b))
+    norm_a = sum(x*x for x in a) ** 0.5
+    norm_b = sum(x*x for x in b) ** 0.5
+    return dot / (norm_a * norm_b + 1e-8)
+
+# === TOPIC DETECTION (simple AI) ===
+async def detect_topic(text):
+    prompt = f"Give a short topic (1-2 words) for this message:\n{text}"
+    try:
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
+        return response.text.strip().lower()
+    except:
+        return "general"
+
+# === SAVE MESSAGE ===
+async def save_message(update: Update):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text
+
+    embedding = await get_embedding(text)
+    topic = await detect_topic(text)
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        INSERT INTO messages (user_id, user_name, chat_id, text, embedding, topic, time)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            update.message.from_user.id,
+            update.message.from_user.first_name,
+            update.message.chat.id,
+            text,
+            str(embedding),
+            topic,
+            datetime.now()
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        logger.error(e)
+
+# === SEMANTIC SEARCH ===
+async def get_relevant_messages(user_input, limit=10):
+    query_embedding = await get_embedding(user_input)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT user_name, text, embedding FROM messages ORDER BY id DESC LIMIT 100")
+    rows = cur.fetchall()
+
+    scored = []
+
+    for u, t, emb in rows:
+        try:
+            emb_list = eval(emb)
+            score = cosine_similarity(query_embedding, emb_list)
+            scored.append((score, u, t))
+        except:
+            continue
+
+    cur.close()
+    conn.close()
+
+    scored.sort(reverse=True)
+    return [(u, t) for score, u, t in scored[:limit] if score > 0.5]
+
+# === TOPIC THREAD ===
+async def get_topic_messages(user_input):
+    topic = await detect_topic(user_input)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    SELECT user_name, text FROM messages
+    WHERE topic = %s
+    ORDER BY id DESC LIMIT 20
+    """, (topic,))
+
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    rows.reverse()
+    return rows
+
+# === FORMAT ===
+def format_messages(msgs):
+    return "\n".join([f"{u}: {t}" for u, t in msgs])
+
+# === AI ===
 async def generate_ai(prompt):
     return await asyncio.to_thread(
         client.models.generate_content,
@@ -158,15 +200,12 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    user_id = update.message.from_user.id
-
-    if is_spamming(user_id):
+    if is_spamming(update.message.from_user.id):
         return
 
     user_input = update.message.text
     bot_username = await get_bot_username(context)
 
-    # Reply OR mention logic
     is_reply = (
         update.message.reply_to_message and
         update.message.reply_to_message.from_user.id == context.bot.id
@@ -176,25 +215,27 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_reply and f"@{bot_username}" not in user_input.lower():
             return
 
-    logger.info(f"Incoming: {user_input}")
-
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=ChatAction.TYPING
     )
 
-    recent = get_recent(50)
-    important = filter_important(recent)
+    # 🧠 Semantic + Topic
+    semantic_msgs = await get_relevant_messages(user_input)
+    topic_msgs = await get_topic_messages(user_input)
+
+    context_msgs = (semantic_msgs + topic_msgs)[-10:]
 
     prompt = f"""
-You are a helpful AI assistant in a Telegram group.
+You are a smart assistant.
 
-Rules:
-- Always respond in Burmese
-- Be concise and friendly
+IMPORTANT:
+- Answer ONLY the question
+- Ignore unrelated context
+- Reply in Burmese
 
-Important context:
-{format_messages(important)}
+Context:
+{format_messages(context_msgs)}
 
 User:
 {user_input}
@@ -203,84 +244,19 @@ User:
     try:
         response = await generate_ai(prompt)
         await update.message.reply_text(response.text)
-
     except Exception as e:
-        logger.error(f"AI ERROR: {e}")
-        await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
-
-# === SUMMARY ===
-async def summarize(update, msgs):
-    if not msgs:
-        await update.message.reply_text("စာမတွေ့ပါ။")
-        return
-
-    prompt = f"""
-အောက်ပါ chat ကို အကျဉ်းချုပ်ပေးပါ။
-
-Chat:
-{format_messages(msgs)}
-"""
-
-    try:
-        response = await generate_ai(prompt)
-        await update.message.reply_text(response.text)
-    except Exception as e:
-        logger.error(f"SUMMARY ERROR: {e}")
-        await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
-
-# === COMMANDS ===
-async def todaysummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msgs = get_messages_by_days(1)
-    await summarize(update, msgs)
-
-async def lastweeksummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msgs = get_messages_by_days(7)
-    await summarize(update, msgs)
-
-# === STATS ===
-def get_top_users(limit=100):
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute(
-            "SELECT user_name FROM messages ORDER BY id DESC LIMIT %s",
-            (limit,)
-        )
-
-        users = [row[0] for row in cur.fetchall()]
-        cur.close()
-        conn.close()
-
-        count = Counter(users)
-
-        result = "📊 Top Users:\n"
-        for user, c in count.most_common(5):
-            result += f"- {user}: {c} messages\n"
-
-        return result
-
-    except Exception as e:
-        logger.error(f"STATS ERROR: {e}")
-        return "Error fetching stats"
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(get_top_users())
+        logger.error(e)
+        await update.message.reply_text("⚠️ Error")
 
 # === HANDLER ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_message(update)
     await chat(update, context)
 
-# === BUILD APP ===
+# === BUILD ===
 app = ApplicationBuilder().token(BOT_TOKEN).build()
-
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("todaysummary", todaysummary))
-app.add_handler(CommandHandler("lastweeksummary", lastweeksummary))
 
-logger.info("Bot is running...")
+print("Bot running...")
 
-# === RUN ===
 app.run_polling(drop_pending_updates=True)
