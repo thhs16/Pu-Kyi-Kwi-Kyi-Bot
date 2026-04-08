@@ -1,7 +1,7 @@
 import os
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter
 
 from telegram import Update
@@ -48,7 +48,7 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         conn.commit()
 
-# === GET RECENT ===
+# === GET DATA ===
 def get_recent(limit=50):
     cursor.execute(
         "SELECT user, text FROM messages ORDER BY id DESC LIMIT ?",
@@ -58,28 +58,41 @@ def get_recent(limit=50):
     rows.reverse()
     return rows
 
+def get_messages_by_days(days=1):
+    cutoff = datetime.now() - timedelta(days=days)
+    cursor.execute("SELECT user, text, time FROM messages")
+    rows = cursor.fetchall()
+    return [(u, t) for u, t, time in rows if datetime.fromisoformat(time) >= cutoff]
+
+def get_yesterday_messages():
+    today = datetime.now().date()
+    start = datetime.combine(today - timedelta(days=1), datetime.min.time())
+    end = datetime.combine(today, datetime.min.time())
+
+    cursor.execute("SELECT user, text, time FROM messages")
+    rows = cursor.fetchall()
+
+    return [(u, t) for u, t, time in rows if start <= datetime.fromisoformat(time) < end]
+
 # === FORMAT ===
 def format_messages(msgs):
     return "\n".join([f"{u}: {t}" for u, t in msgs])
 
-# === CHAT ===
+# === AI CHAT ===
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     user_input = update.message.text
 
-    # ✅ Safe bot username
     bot = await context.bot.get_me()
     bot_username = bot.username.lower()
 
     logger.info(f"Incoming: {user_input}")
-    logger.info(f"Bot username: @{bot_username}")
 
-    # ✅ Group logic (must mention bot)
+    # Group → must mention
     if update.message.chat.type != "private":
         if f"@{bot_username}" not in user_input.lower():
-            logger.info("Not mentioned → ignoring")
             return
 
     recent = get_recent(50)
@@ -111,6 +124,46 @@ Answer in Burmese:
         logger.error(f"AI ERROR: {e}")
         await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
 
+# === SUMMARY ===
+async def summarize_command(update, msgs):
+    if not msgs:
+        await update.message.reply_text("စာမတွေ့ပါ။")
+        return
+
+    prompt = f"""
+အောက်ပါ chat ကို အကျဉ်းချုပ်ပေးပါ။
+
+Chat:
+{format_messages(msgs)}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
+        await update.message.reply_text(response.text)
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text("⚠️ AI မရရှိနိုင်ပါ။")
+
+# === COMMANDS ===
+async def todaysummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msgs = get_messages_by_days(1)
+    await summarize_command(update, msgs)
+
+async def yesterdaysummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msgs = get_yesterday_messages()
+    await summarize_command(update, msgs)
+
+async def last3dayssummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msgs = get_messages_by_days(3)
+    await summarize_command(update, msgs)
+
+async def lastweeksummary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msgs = get_messages_by_days(7)
+    await summarize_command(update, msgs)
+
 # === STATS ===
 def get_top_users(limit=100):
     cursor.execute(
@@ -139,8 +192,12 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("todaysummary", todaysummary))
+app.add_handler(CommandHandler("yesterdaysummary", yesterdaysummary))
+app.add_handler(CommandHandler("last3dayssummary", last3dayssummary))
+app.add_handler(CommandHandler("lastweeksummary", lastweeksummary))
 
 logger.info("Bot is starting...")
 
-# ✅ RUN (ONLY ONCE)
+# === RUN ===
 app.run_polling(drop_pending_updates=True)
