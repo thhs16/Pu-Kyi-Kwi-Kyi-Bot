@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import json
 from datetime import datetime, timedelta
 from collections import Counter
 
@@ -67,6 +66,24 @@ def is_spamming(user_id):
     user_last_message[user_id] = now
     return False
 
+def is_why_question(text):
+    text = text.lower()
+    return any(word in text for word in [
+        "why", "reason", "cause",
+        "ဘာလို့", "ဘာကြောင့်", "အကြောင်း"
+    ])
+
+def filter_reason_messages(messages):
+    keywords = ["because", "since", "so", "therefore", "due to",
+                "လို့", "ကြောင့်", "အတွက်"]
+
+    filtered = []
+    for u, t, time in messages:
+        if any(k in t.lower() for k in keywords):
+            filtered.append((u, t, time))
+
+    return filtered if filtered else messages
+
 # === TOPIC ===
 async def detect_topic(text):
     prompt = f"Summarize this text into a short topic (1-2 words):\n\n{text}"
@@ -107,25 +124,23 @@ async def save_message(update: Update):
     cur.close()
     conn.close()
 
-# === REPLY CONTEXT ===
+# === MEMORY ===
 async def get_reply_context(update: Update):
     if not update.message.reply_to_message:
         return []
 
     msg = update.message.reply_to_message
-
     if msg.text:
-        return [(msg.from_user.first_name, msg.text)]
+        return [(msg.from_user.first_name, msg.text, datetime.now())]
 
     return []
 
-# === RECENT MEMORY ===
 async def get_recent_messages(chat_id, limit=6):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-    SELECT user_name, text FROM messages
+    SELECT user_name, text, time FROM messages
     WHERE chat_id = %s
     ORDER BY id DESC LIMIT %s
     """, (chat_id, limit))
@@ -137,7 +152,6 @@ async def get_recent_messages(chat_id, limit=6):
     rows.reverse()
     return rows
 
-# === TOPIC MEMORY ===
 async def get_topic_messages(user_input):
     topic = await detect_topic(user_input)
 
@@ -145,7 +159,7 @@ async def get_topic_messages(user_input):
     cur = conn.cursor()
 
     cur.execute("""
-    SELECT user_name, text FROM messages
+    SELECT user_name, text, time FROM messages
     WHERE topic = %s
     ORDER BY id DESC LIMIT 10
     """, (topic,))
@@ -158,7 +172,14 @@ async def get_topic_messages(user_input):
     return rows
 
 def format_messages(msgs):
-    return "\n".join([f"{u}: {t}" for u, t in msgs])
+    formatted = []
+    for u, t, time in msgs:
+        try:
+            time_str = time.strftime("%H:%M")
+        except:
+            time_str = "??:??"
+        formatted.append(f"[{time_str}] {u}: {t}")
+    return "\n".join(formatted)
 
 # === AI ===
 async def generate_ai(prompt):
@@ -195,18 +216,31 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent_msgs = await get_recent_messages(update.message.chat.id)
     topic_msgs = await get_topic_messages(user_input)
 
-    context_msgs = (reply_msgs + recent_msgs + topic_msgs)[-12:]
+    context_msgs = reply_msgs + recent_msgs + topic_msgs
+
+    if is_why_question(user_input):
+        context_msgs = filter_reason_messages(context_msgs)
+
+    context_msgs = context_msgs[-12:]
 
     prompt = f"""
 You are a friendly, helpful AI assistant (ChatGPT-style).
 
 IMPORTANT:
-- Detect the user's language
-- Reply in the SAME language (English or Burmese)
+- Detect the user's language (English or Burmese)
+- Reply in the SAME language
 - Be warm, natural, and slightly playful 😄
 - Keep answers clear and helpful
-- Use conversation context if relevant
-- If this is a follow-up question, connect it to previous messages
+- Use conversation context carefully
+
+CRITICAL:
+- If the user asks about time:
+    → Pay attention to timestamps in the context
+
+- If the user asks "why":
+    → Find the reason from context
+    → Do NOT guess
+    → If no reason found, say you don’t see a clear reason
 
 Context:
 {format_messages(context_msgs)}
@@ -244,26 +278,17 @@ async def generate_summary(days):
     text_data = "\n".join([f"{u}: {t}" for u, t in rows])
 
     prompt = f"""
-You are a friendly AI assistant.
-
 IMPORTANT:
-- Detect the language of the chat
-- If Burmese → use Burmese format
-- If English → use English format
+- Detect language automatically
 
 If Burmese:
-အောက်ပါ chat ကို WHO SAID WHAT အလိုက် အကျဉ်းချုပ်ပေးပါ။
-
-Format:
 Summary:
 - Name: အဓိကအချက်
-
 Decision (ရှိပါက)
 
 If English:
 Summary:
 - Name: key point
-
 Decision (if any)
 
 Chat:
