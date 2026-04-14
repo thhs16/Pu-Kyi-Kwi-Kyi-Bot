@@ -39,7 +39,6 @@ def init_db():
         user_name TEXT,
         chat_id BIGINT,
         text TEXT,
-        embedding TEXT,
         topic TEXT,
         time TIMESTAMP
     )
@@ -68,27 +67,6 @@ def is_spamming(user_id):
     user_last_message[user_id] = now
     return False
 
-# === EMBEDDING ===
-async def get_embedding(text):
-    try:
-        response = await asyncio.to_thread(
-            client.models.embed_content,
-            model="models/text-embedding-004",
-            contents=text
-        )
-        return response.embeddings[0].values
-    except Exception as e:
-        logger.warning(f"Embedding failed: {e}")
-        return None
-
-def cosine_similarity(a, b):
-    if not a or not b:
-        return 0
-    dot = sum(x*y for x, y in zip(a, b))
-    norm_a = sum(x*x for x in a) ** 0.5
-    norm_b = sum(x*x for x in b) ** 0.5
-    return dot / (norm_a * norm_b + 1e-8)
-
 # === TOPIC ===
 async def detect_topic(text):
     prompt = f"Summarize this text into a short topic (1-2 words):\n\n{text}"
@@ -108,21 +86,19 @@ async def save_message(update: Update):
         return
 
     text = update.message.text.strip()
-    embedding = await get_embedding(text)
     topic = await detect_topic(text)
 
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-    INSERT INTO messages (user_id, user_name, chat_id, text, embedding, topic, time)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    INSERT INTO messages (user_id, user_name, chat_id, text, topic, time)
+    VALUES (%s, %s, %s, %s, %s, %s)
     """, (
         update.message.from_user.id,
         update.message.from_user.first_name,
         update.message.chat.id,
         text,
-        json.dumps(embedding),
         topic,
         datetime.now()
     ))
@@ -131,7 +107,7 @@ async def save_message(update: Update):
     cur.close()
     conn.close()
 
-# === NEW: REPLY CONTEXT ===
+# === REPLY CONTEXT ===
 async def get_reply_context(update: Update):
     if not update.message.reply_to_message:
         return []
@@ -143,33 +119,25 @@ async def get_reply_context(update: Update):
 
     return []
 
-# === SEARCH ===
-async def get_relevant_messages(user_input, limit=10):
-    query_embedding = await get_embedding(user_input)
-    if not query_embedding:
-        return []
-
+# === RECENT MEMORY ===
+async def get_recent_messages(chat_id, limit=6):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT user_name, text, embedding FROM messages ORDER BY id DESC LIMIT 100")
+
+    cur.execute("""
+    SELECT user_name, text FROM messages
+    WHERE chat_id = %s
+    ORDER BY id DESC LIMIT %s
+    """, (chat_id, limit))
+
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    scored = []
-    for u, t, emb in rows:
-        try:
-            emb_list = json.loads(emb)
-            if not emb_list:
-                continue
-            score = cosine_similarity(query_embedding, emb_list)
-            scored.append((score, u, t))
-        except:
-            continue
+    rows.reverse()
+    return rows
 
-    scored.sort(reverse=True)
-    return [(u, t) for score, u, t in scored[:limit] if score > 0.5]
-
+# === TOPIC MEMORY ===
 async def get_topic_messages(user_input):
     topic = await detect_topic(user_input)
 
@@ -179,7 +147,7 @@ async def get_topic_messages(user_input):
     cur.execute("""
     SELECT user_name, text FROM messages
     WHERE topic = %s
-    ORDER BY id DESC LIMIT 20
+    ORDER BY id DESC LIMIT 10
     """, (topic,))
 
     rows = cur.fetchall()
@@ -222,12 +190,12 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # 🔥 NEW CONTEXT SYSTEM
+    # 🔥 MEMORY SYSTEM
     reply_msgs = await get_reply_context(update)
-    semantic_msgs = await get_relevant_messages(user_input)
+    recent_msgs = await get_recent_messages(update.message.chat.id)
     topic_msgs = await get_topic_messages(user_input)
 
-    context_msgs = (reply_msgs + semantic_msgs + topic_msgs)[-10:]
+    context_msgs = (reply_msgs + recent_msgs + topic_msgs)[-12:]
 
     prompt = f"""
 You are a friendly, helpful AI assistant (ChatGPT-style).
@@ -236,9 +204,9 @@ IMPORTANT:
 - Detect the user's language
 - Reply in the SAME language (English or Burmese)
 - Be warm, natural, and slightly playful 😄
-- Keep responses clear and helpful
-- Answer ONLY the user's question
-- Use context if relevant
+- Keep answers clear and helpful
+- Use conversation context if relevant
+- If this is a follow-up question, connect it to previous messages
 
 Context:
 {format_messages(context_msgs)}
@@ -258,7 +226,7 @@ User:
     except:
         await update.message.reply_text("⚠️ System is busy.")
 
-# === SUMMARY (your format included) ===
+# === SUMMARY ===
 async def generate_summary(days):
     conn = get_conn()
     cur = conn.cursor()
