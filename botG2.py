@@ -102,7 +102,7 @@ async def detect_topic(text):
     except:
         return "general"
 
-# === SAVE ===
+# === SAVE MESSAGE ===
 async def save_message(update: Update):
     if not update.message or not update.message.text:
         return
@@ -130,18 +130,6 @@ async def save_message(update: Update):
     conn.commit()
     cur.close()
     conn.close()
-
-# === NEW: REPLY CONTEXT ===
-async def get_reply_context(update: Update):
-    if not update.message.reply_to_message:
-        return []
-
-    msg = update.message.reply_to_message
-
-    if msg.text:
-        return [(msg.from_user.first_name, msg.text)]
-
-    return []
 
 # === SEARCH ===
 async def get_relevant_messages(user_input, limit=10):
@@ -222,12 +210,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    # 🔥 NEW CONTEXT SYSTEM
-    reply_msgs = await get_reply_context(update)
     semantic_msgs = await get_relevant_messages(user_input)
     topic_msgs = await get_topic_messages(user_input)
-
-    context_msgs = (reply_msgs + semantic_msgs + topic_msgs)[-10:]
+    context_msgs = (semantic_msgs + topic_msgs)[-10:]
 
     prompt = f"""
 You are a friendly, helpful AI assistant (ChatGPT-style).
@@ -235,10 +220,12 @@ You are a friendly, helpful AI assistant (ChatGPT-style).
 IMPORTANT:
 - Detect the user's language
 - Reply in the SAME language (English or Burmese)
+- Use a neutral tone
 - Be warm, natural, and slightly playful 😄
-- Keep responses clear and helpful
+- Add light humor when appropriate
+- Be clear and helpful
 - Answer ONLY the user's question
-- Use context if relevant
+- Ignore unrelated context
 
 Context:
 {format_messages(context_msgs)}
@@ -256,9 +243,9 @@ User:
         else:
             await update.message.reply_text("⚠️ Something went wrong.")
     except:
-        await update.message.reply_text("⚠️ System is busy.")
+        await update.message.reply_text("⚠️ System is busy. Try again later.")
 
-# === SUMMARY (your format included) ===
+# === SUMMARY ===
 async def generate_summary(days):
     conn = get_conn()
     cur = conn.cursor()
@@ -276,26 +263,21 @@ async def generate_summary(days):
     text_data = "\n".join([f"{u}: {t}" for u, t in rows])
 
     prompt = f"""
-You are a friendly AI assistant.
+You are a friendly AI assistant (ChatGPT-style).
 
 IMPORTANT:
-- Detect the language of the chat
-- If Burmese → use Burmese format
-- If English → use English format
+- Detect language
+- Use same language
+- Friendly and clear 😄
 
 If Burmese:
-အောက်ပါ chat ကို WHO SAID WHAT အလိုက် အကျဉ်းချုပ်ပေးပါ။
-
-Format:
 Summary:
 - Name: အဓိကအချက်
-
 Decision (ရှိပါက)
 
 If English:
 Summary:
 - Name: key point
-
 Decision (if any)
 
 Chat:
